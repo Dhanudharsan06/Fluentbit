@@ -1,0 +1,57 @@
+[SERVICE]
+    Flush          1
+    Daemon         Off
+    Log_Level      info
+    Parsers_File   parsers.conf
+    Parsers_File   parse_custom.conf
+
+[INPUT]
+    Name               syslog
+    Mode               udp
+    Listen             0.0.0.0
+    Port               1517
+    Parser             syslog-passthrough
+    Tag                syslog
+    Source_Address_Key hostIp
+
+[INPUT]
+    Name               syslog
+    Mode               tcp
+    Listen             0.0.0.0
+    Port               1518
+    Parser             syslog-passthrough
+    Tag                syslog
+    Source_Address_Key hostIp
+
+[FILTER]
+    Name    lua
+    Match   syslog
+    script  enrich_syslog.lua
+    call    enrich
+
+[OUTPUT]
+    Name   stdout
+    Match  *
+
+[OUTPUT]
+    Name   file
+    Match  *
+    Path   data\
+    File   syslog_parsed.log
+    Format Plain
+
+[OUTPUT]
+    Name              es
+    Match             *
+    Host              127.0.0.1
+    Port              9200
+    Index             ScribblerCurrent
+    Suppress_Type_Name On
+
+[OUTPUT]
+    Name              syslog
+    Match             *
+    Host              10.10.1.92
+    Port              1514
+    Mode              tcp
+    syslog_format     rfc5424

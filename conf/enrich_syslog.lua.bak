@@ -1,0 +1,257 @@
+-- =====================================================================
+-- Fluent Bit syslog processor -- port of the Logstash "syslog" filter.
+--
+-- Pipeline parity with Logstash:
+--   1. grok       -> detect RFC5424 / RFC3164 and capture fields
+--   2. dateruby   -> syslog_timestamp from syslog_timestamp_original
+--   3. mutate     -> rename message->rawmessage, syslog_message->message,
+--                    set syslog_message_format, blank original for 3164
+--   4. pri rules  -> missing / >191  => pri=13, format="Other"
+--   5. syslog_pri -> syslog_facility_code, syslog_severity_code
+--   6. final      -> ingest_protocol, host=hostIp, lowercase host/hostIp,
+--                    drop syslog_version / tags / port / event
+--
+-- Field names intentionally match the Logstash output model:
+--   syslog_host, syslog_program, syslog_process_id, syslog_message_id
+--
+-- KNOWN DIFFERENCES vs Logstash (documented, see chat):
+--   * dns { reverse => host } is NOT reproduced -- Fluent Bit/Lua has no
+--     reverse-DNS resolver. `host` stays equal to the (lowercased) IP.
+--   * dateruby nanosecond precision -> approximated to millisecond.
+--   * A leading/embedded UTF-8 BOM is stripped from the message (cleanup);
+--     Logstash keeps it. Set STRIP_BOM=false below for exact parity.
+-- =====================================================================
+
+local STRIP_BOM = true
+
+-- RFC3164 timestamps ("Mmm dd HH:MM:SS") carry NO timezone -- they are the
+-- sender's local wall-clock time. To store the correct instant we must tag
+-- them with an offset. nil = auto-detect THIS host's local offset (correct
+-- when sender and collector share a timezone). Force a fixed zone instead by
+-- setting e.g. "+00:00" (senders emit UTC) or "+05:30".
+local RFC3164_TZ = nil
+
+-- Store-and-forward unwrapping. A relay may queue a log and later re-send it
+-- wrapped in a NEW syslog envelope, so the outer timestamp is the *forward*
+-- time and the inner one is the *original generation* time. When true, if a
+-- message body is itself a syslog frame (optionally octet-count framed per
+-- RFC6587, optionally BOM-prefixed), the INNER message is treated as the real
+-- log: its timestamp, host, program, process id and message id win. The outer
+-- envelope survives only in `rawmessage`. `@timestamp` stays the ingest time.
+local UNWRAP_FORWARDED = true
+
+-- "-" (RFC5424 NILVALUE) and empty string both mean "field absent".
+local function nv(v)
+    if v == nil or v == "-" or v == "" then return nil end
+    return v
+end
+
+-- ---------- RFC5424 --------------------------------------------------
+-- body (pri already stripped) = VERSION SP TS SP HOST SP APP SP PROCID
+--                               SP MSGID SP [SD] [MSG]
+local function parse_rfc5424(body)
+    local ver, ts, host, prog, procid, msgid, rest =
+        body:match("^(%d+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s*(.*)$")
+    if ver == nil then return nil end
+    -- Second token must look like an ISO-8601 timestamp (accept both the
+    -- spec ':' form and the tester's '.' form). This is the discriminator.
+    if not ts:match("^%d%d%d%d%-%d%d%-%d%dT") then return nil end
+
+    -- grok's "(?:- |)" only strips a NILVALUE structured-data marker.
+    -- Any real "[...]" structured data stays inside the message.
+    local msg = rest
+    local stripped = rest:match("^%-%s+(.*)$")
+    if stripped ~= nil then msg = stripped end
+    if rest == "-" then msg = "" end
+
+    return {
+        syslog_version            = ver,
+        syslog_timestamp_original = ts,
+        syslog_host               = nv(host),
+        syslog_program            = nv(prog),
+        syslog_process_id         = nv(procid),
+        syslog_message_id         = nv(msgid),
+        syslog_message            = msg,
+        format                    = "Rfc5424",
+    }
+end
+
+-- ---------- RFC3164 --------------------------------------------------
+-- body = TIMESTAMP [HOST] MSG   (TIMESTAMP = "Mmm dd HH:MM:SS" or ISO)
+local function parse_rfc3164(body)
+    local ts, rest = body:match("^(%a%a%a%s+%d+%s+%d%d:%d%d:%d%d)%s+(.*)$")
+    if ts == nil then
+        ts, rest = body:match("^(%d%d%d%d%-%d%d%-%d%dT%S+)%s+(.*)$")
+    end
+    if ts == nil then
+        -- No recognizable timestamp: whole body is the message.
+        ts, rest = nil, body
+    end
+
+    -- IPORHOST-like first token (no ':') is treated as the host, matching
+    -- grok pattern B; otherwise there is no host (pattern C).
+    local host, msg
+    local first, remainder = rest:match("^(%S+)%s+(.*)$")
+    if first ~= nil and first:match("^[%w%.%-]+$") then
+        host, msg = first, remainder
+    else
+        msg = rest
+    end
+
+    return {
+        syslog_timestamp_original = ts,
+        syslog_host               = nv(host),
+        syslog_message            = msg,
+        format                    = "Rfc3164",
+    }
+end
+
+-- If `msg` is itself a syslog frame -- optionally BOM-prefixed and/or
+-- octet-count framed ("213 <14>1 ...", RFC6587) -- parse and return the inner
+-- record plus its PRI. Returns nil when there is no embedded syslog message.
+local function try_unwrap(msg, parse_rfc5424, parse_rfc3164)
+    if msg == nil then return nil end
+    local s = msg
+    s = s:gsub("^\239\187\191", "")   -- leading BOM
+    s = s:gsub("^%d+%s+", "")          -- octet-count frame (RFC6587)
+    s = s:gsub("^\239\187\191", "")   -- BOM between count and PRI
+    local ipri, ibody = s:match("^<(%d+)>(.*)$")
+    if ipri == nil then return nil end
+    local inner = parse_rfc5424(ibody) or parse_rfc3164(ibody)
+    if inner == nil then return nil end
+    inner._pri = ipri
+    return inner
+end
+
+-- Normalize the tester's dotted time (T07.28.41) to valid ISO (T07:28:41).
+local function normalize_iso(ts)
+    if ts == nil then return nil end
+    return (ts:gsub("T(%d%d)%.(%d%d)%.(%d%d)", "T%1:%2:%3"))
+end
+
+-- Local UTC offset (e.g. "+05:30") for the given epoch, or the forced
+-- RFC3164_TZ override. Computed from the CRT without relying on strftime %z.
+local function tz_offset(epoch)
+    if RFC3164_TZ ~= nil then return RFC3164_TZ end
+    local t = os.date("!*t", epoch); t.isdst = false
+    local diff = os.difftime(epoch, os.time(t))
+    local sign = "+"
+    if diff < 0 then sign = "-"; diff = -diff end
+    return string.format("%s%02d:%02d", sign,
+        math.floor(diff / 3600), math.floor((diff % 3600) / 60))
+end
+
+-- Month name -> number for RFC3164 timestamps.
+local MON = {Jan="01",Feb="02",Mar="03",Apr="04",May="05",Jun="06",
+             Jul="07",Aug="08",Sep="09",Oct="10",Nov="11",Dec="12"}
+
+function enrich(tag, timestamp, record)
+    -- ---- rawmessage: the complete original line, as received ----
+    local raw_pri  = record["pri"]
+    local raw_body = record["message"] or ""
+    if raw_pri ~= nil then
+        record["rawmessage"] = "<" .. raw_pri .. ">" .. raw_body
+    else
+        record["rawmessage"] = raw_body
+    end
+
+    -- ---- ingest @timestamp (millisecond precision, UTC) ----
+    local sec = math.floor(timestamp)
+    local ms  = math.floor((timestamp - sec) * 1000 + 0.5)
+    if ms > 999 then ms = 999 end
+    local ingest_iso = os.date("!%Y-%m-%dT%H:%M:%S", sec) .. string.format(".%03dZ", ms)
+    record["@timestamp"] = ingest_iso
+    record["@version"]   = "1"
+
+    -- ---- 1. grok: detect + parse ----
+    local p = parse_rfc5424(raw_body) or parse_rfc3164(raw_body)
+    local effective_pri = raw_pri
+
+    -- ---- 1b. unwrap store-and-forward envelopes (innermost wins) ----
+    if UNWRAP_FORWARDED then
+        local guard = 0
+        while guard < 8 do
+            local inner = try_unwrap(p.syslog_message, parse_rfc5424, parse_rfc3164)
+            if inner == nil then break end
+            effective_pri = inner._pri or effective_pri
+            p = inner
+            guard = guard + 1
+        end
+    end
+
+    local fmt = p.format
+
+    -- ---- 2. dateruby: syslog_timestamp from the original ----
+    local syslog_timestamp
+    if p.format == "Rfc5424" then
+        syslog_timestamp = normalize_iso(p.syslog_timestamp_original)
+    elseif p.syslog_timestamp_original ~= nil then
+        -- RFC3164 "Mmm dd HH:MM:SS" -> ISO using the current (ingest) year.
+        local mon, day, clock =
+            p.syslog_timestamp_original:match("^(%a%a%a)%s+(%d+)%s+(%d%d:%d%d:%d%d)$")
+        if mon ~= nil and MON[mon] ~= nil then
+            -- Local year, and tag with the local offset (NOT "Z"): the
+            -- RFC3164 wall clock is local time, so this yields the correct
+            -- UTC instant while preserving the original reading in Kibana.
+            local year = os.date("%Y", sec)
+            syslog_timestamp = string.format("%s-%s-%02dT%s%s",
+                year, MON[mon], tonumber(day), clock, tz_offset(sec))
+        else
+            syslog_timestamp = normalize_iso(p.syslog_timestamp_original)
+        end
+    end
+
+    -- ---- 3. mutate: message renames + per-format fields ----
+    local message = p.syslog_message or ""
+    if STRIP_BOM then
+        message = message:gsub("\239\187\191", "")   -- strip UTF-8 BOM
+    end
+    record["message"] = message   -- final rename: syslog_message -> message
+
+    record["syslog_message_format"] = fmt
+    if p.syslog_host        ~= nil then record["syslog_host"]        = p.syslog_host end
+    if p.syslog_program     ~= nil then record["syslog_program"]     = p.syslog_program end
+    if p.syslog_process_id  ~= nil then record["syslog_process_id"]  = p.syslog_process_id end
+    if p.syslog_message_id  ~= nil then record["syslog_message_id"]  = p.syslog_message_id end
+
+    -- RFC5424 keeps the original timestamp string; RFC3164 blanks it.
+    if p.format == "Rfc5424" then
+        record["syslog_timestamp_original"] = p.syslog_timestamp_original or ""
+    else
+        record["syslog_timestamp_original"] = ""
+    end
+
+    -- ---- 4. pri rules (use the innermost/original PRI when unwrapped) ----
+    local pri = tonumber(effective_pri)
+    if pri == nil or pri > 191 then
+        pri = 13
+        record["syslog_message_format"] = "Other"
+    end
+    record["syslog_pri"] = pri
+
+    -- ---- 5. syslog_pri: facility / severity codes ----
+    record["syslog_facility_code"] = math.floor(pri / 8)
+    record["syslog_severity_code"] = pri % 8
+
+    -- ---- timestamp fallback (RFC3164 relay standard 4.3.1) ----
+    if syslog_timestamp == nil or syslog_timestamp == "" then
+        syslog_timestamp = ingest_iso
+    end
+    record["syslog_timestamp"] = syslog_timestamp
+
+    -- ---- 6. final: protocol + host normalization ----
+    record["ingest_protocol"] = "syslog"       -- rename: type -> ingest_protocol
+
+    -- hostIp arrives as "udp://<ip>:<port>"; reduce to a bare, lowercase IP.
+    local ip = tostring(record["hostIp"] or "")
+    ip = ip:gsub("^%a+://", ""):gsub(":%d+$", ""):lower()
+    record["hostIp"] = ip
+    record["host"]   = ip     -- NOTE: no reverse-DNS (see header)
+
+    -- ---- drop fields Logstash removes ----
+    record["pri"]           = nil
+    record["syslog_version"] = nil
+
+    -- return code 2 = record modified, keep original event timestamp
+    return 2, timestamp, record
+end
