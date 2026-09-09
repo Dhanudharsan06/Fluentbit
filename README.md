@@ -1,66 +1,63 @@
-# Fluentbit
-testing fluent bit
+## Fluentbit
+## testing fluent bit
 
+## Syslog Input
 
-- Format of the data required by elasticsearch
-```	
-	{
-	"hostIp": "127.0.0.1",
-	"syslog_severity_code": 6,
-	"syslog_timestamp": "2026-09-01T05:43:01.387508100Z",
-	"rawmessage": "<14>1 2026-09-01T05.43.01.360389+00:00 SYSKEYDEV-00130 SyslogTester 14236 dfc632a2-9faf-4d6c-b987-109fff7d [customSturcturedData@32473 Environment=\"Windows 10\" Hardware=\"Desktop PC\"] ﻿Fluentbit forward test",
-	"host": "127.0.0.1",
-	"@timestamp": "2026-09-01T05:43:01.387508100Z",
-	"syslog_facility_code": 1,
-	"@version": "1",
-	"syslog_message_format": "Rfc3164",
-	"message": "1 2026-09-01T05.43.01.360389+00:00 SYSKEYDEV-00130 SyslogTester 14236 dfc632a2-9faf-4d6c-b987-109fff7d [customSturcturedData@32473 Environment=\"Windows 10\" Hardware=\"Desktop PC\"] ﻿Fluentbit forward test",
-	"syslog_pri": 14,
-	"syslog_timestamp_original": "",
-	"ingest_protocol": "syslog"
-}
+# UDP
+```
+[INPUT]
+    Name               syslog
+    Mode               udp
+    Listen             0.0.0.0
+    Port               1517
+    Parser             syslog-passthrough
+    Tag                syslog
+    Source_Address_Key hostIp
 ```
 
-- The data returned by the default Rfc5424 filter, when Rfc5424 format is sent, is as follows:
-[2026/09/01 15:20:09.766] [ warn] [parser:syslog-rfc5424] invalid time format %Y-%m-%dT%H:%M:%S.%L%z for '2026-09-01T09.50.09.744805+00:00'
-[0] syslog: [[1788256209.766211100, {}], {"pri"=>"14", "host"=>"SYSKEYDEV-00130", "ident"=>"SyslogTester", "pid"=>"41928", "msgid"=>"aee187b5-faf6-4343-a9e8-69107fa9", "extradata"=>"[customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"]", "message"=>"∩╗┐Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:62513"}]
+# TCP
 
-- when default Rfc5424 parser is used, and other format is sent
-   [2026/09/01 15:24:38.378] [ warn] [input:syslog:syslog.0] error parsing log message with parser 'syslog-rfc5424'
-
-
-So to recieve all format of the logs custom parser is required to be used, which can parse all the formats of the logs. So the custom parser is created and used in the configuration file. The custom parser is as follows:
-```
-[PARSER
-    Name    syslog-passthrough
-    Format  regex
-    Regex   ^(?:\<(?<pri>[0-9]{1,5})\>)?(?<message>.*)$
+In Tcp Can't combine the message framing in single port, but we can achieve by editing the code of the Fluent bit.
 
 ```
-
-The output of the custom parser is as follows:
-
-Rfc3164 format:
-Raw-message: 71 <14>Sep  2 10:28:08 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test
-
-[2026/09/02 10:27:35.591] [ info] [engine] Shutdown Grace Period=5, Shutdown Input Grace Period=2
-[0] syslog: [[1788325088.366688300, {}], {"pri"=>"14", "message"=>"Sep  2 10:28:08 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:61823"}]
-[0] syslog: [[1788325088.366688300, {}], {"pri"=>"14", "message"=>"Sep  2 10:28:08 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:61823"}]
-
-Rfc5424 format:
-Raw-message: 208 <14>1 2026-09-02T05.09.22.557550+00:00 SYSKEYDEV-00130 SyslogTester 22828 b90b7abc-e54d-4f9e-b1de-0a506fca [customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"] ?Fluentbit forward test
-
-[0] syslog: [[1788325762.577822300, {}], {"pri"=>"14", "message"=>"1 2026-09-02T05.09.22.557550+00:00 SYSKEYDEV-00130 SyslogTester 22828 b90b7abc-e54d-4f9e-b1de-0a506fca [customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"] ∩╗┐Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:56174"}]
-
-Now we can target to achieve the format required for the elasticsearch, by using the custom parser and the filter. The filter is as follows:
-```
-[FILTER]
-    Name    lua
-    Match   syslog
-    script  enrich_syslog.lua
-    call    enrich
+[INPUT]
+    Name               syslog
+    Mode               tcp
+    Listen             0.0.0.0
+    Port               1518
+    Parser             syslog-passthrough
+    Tag                syslog
+    Source_Address_Key hostIp
+    Format             newline
 ```
 
+# TCP with TLS
+
+In Tcp/Tls Can't combine the message framing in single port, but we can achieve by editing the code of the Fluent bit.
+
+```
+[INPUT]
+    Name               syslog
+    Mode               tcp
+    Listen             0.0.0.0
+    Port               1519
+    Parser             syslog-passthrough
+    Tag                syslog
+    Format             newline
+    Tls                on
+    tls.crt_file       C:\Users\DhanudharsanDE\Downloads\publickey.crt
+    tls.key_file       C:\Users\DhanudharsanDE\Downloads\privatekey.key
+    tls.key_passwd     pass
+    tls.min_version    TLSv1.1
+    tls.max_version    TLSv1.3
+    tls.verify         off
+```
+
+# CEF
+```
+```
+
+## Custom Formatter
 where enrich_syslog.lua is a lua script which is used to enrich the data and make it in the format required for the elasticsearch.
 
 steps in the enrich_syslog.lua script are as follows:
@@ -71,7 +68,7 @@ steps in the enrich_syslog.lua script are as follows:
 - return the enriched data to the output elasticsearch.
 
 
-processed Rfc5424 log:
+# processed Rfc5424 log:
 
 raw log: 208 <14>1 2026-09-02T07.49.38.846798+00:00 SYSKEYDEV-00130 SyslogTester 33340 0722586a-4c09-4198-8e45-663a20ab [customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"] ?Fluentbit forward test
 
@@ -96,7 +93,7 @@ Processed message:
 	}]
 ```
 
-Processed Rfc3164 log:
+# Processed Rfc3164 log:
 
 raw log: 71 <14>Sep  2 13:23:38 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test
 
@@ -122,7 +119,26 @@ processed message:
 
 
 
-## Forwarding to the downstream collector (Logstash `output { syslog { ... } }`)
+## Syslog Output
+
+# print the logs to the console
+```
+[OUTPUT]
+    Name   stdout
+    Match  syslog
+```
+
+# store in File
+```
+[OUTPUT]
+    Name   file
+    Match  *
+    Path   data\
+    File   syslog_parsed.log
+    Format Plain
+```
+
+# Forward thourg Syslog to another Syslog server
 
 The Logstash block being replaced emits, per record:
 
@@ -173,3 +189,69 @@ field from the stored record. Every other OUTPUT matches the exact tag
 
 `ssl_verify => "true"` in the Logstash block is inert under `protocol => tcp`
 (it only applies to `ssl-tcp`), so this stays a plain TCP connection.
+
+# Forward Logs to Elasticsearch
+- Format of the data required by elasticsearch
+```	
+	{
+	"hostIp": "127.0.0.1",
+	"syslog_severity_code": 6,
+	"syslog_timestamp": "2026-09-01T05:43:01.387508100Z",
+	"rawmessage": "<14>1 2026-09-01T05.43.01.360389+00:00 SYSKEYDEV-00130 SyslogTester 14236 dfc632a2-9faf-4d6c-b987-109fff7d [customSturcturedData@32473 Environment=\"Windows 10\" Hardware=\"Desktop PC\"] ﻿Fluentbit forward test",
+	"host": "127.0.0.1",
+	"@timestamp": "2026-09-01T05:43:01.387508100Z",
+	"syslog_facility_code": 1,
+	"@version": "1",
+	"syslog_message_format": "Rfc3164",
+	"message": "1 2026-09-01T05.43.01.360389+00:00 SYSKEYDEV-00130 SyslogTester 14236 dfc632a2-9faf-4d6c-b987-109fff7d [customSturcturedData@32473 Environment=\"Windows 10\" Hardware=\"Desktop PC\"] ﻿Fluentbit forward test",
+	"syslog_pri": 14,
+	"syslog_timestamp_original": "",
+	"ingest_protocol": "syslog"
+}
+```
+
+- The data returned by the default Rfc5424 filter, when Rfc5424 format is sent, is as follows:
+```
+[2026/09/01 15:20:09.766] [ warn] [parser:syslog-rfc5424] invalid time format %Y-%m-%dT%H:%M:%S.%L%z for '2026-09-01T09.50.09.744805+00:00'
+[0] syslog: [[1788256209.766211100, {}], {"pri"=>"14", "host"=>"SYSKEYDEV-00130", "ident"=>"SyslogTester", "pid"=>"41928", "msgid"=>"aee187b5-faf6-4343-a9e8-69107fa9", "extradata"=>"[customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"]", "message"=>"∩╗┐Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:62513"}]
+```
+
+- when default Rfc5424 parser is used, and other format is sent
+   ```
+   [2026/09/01 15:24:38.378] [ warn] [input:syslog:syslog.0] error parsing log message with parser 'syslog-rfc5424'
+   ```
+
+So to recieve all format of the logs custom parser is required to be used, which can parse all the formats of the logs. So the custom parser is created and used in the configuration file. The custom parser is as follows:
+```
+[PARSER
+    Name    syslog-passthrough
+    Format  regex
+    Regex   ^(?:\<(?<pri>[0-9]{1,5})\>)?(?<message>.*)$
+
+```
+
+The output of the custom parser is as follows:
+
+- Rfc3164 format:
+Raw-message: 71 <14>Sep  2 10:28:08 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test
+```
+[2026/09/02 10:27:35.591] [ info] [engine] Shutdown Grace Period=5, Shutdown Input Grace Period=2
+[0] syslog: [[1788325088.366688300, {}], {"pri"=>"14", "message"=>"Sep  2 10:28:08 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:61823"}]
+[0] syslog: [[1788325088.366688300, {}], {"pri"=>"14", "message"=>"Sep  2 10:28:08 SYSKEYDEV-00130 SyslogTester:Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:61823"}]
+```
+
+- Rfc5424 format:
+```
+Raw-message: 208 <14>1 2026-09-02T05.09.22.557550+00:00 SYSKEYDEV-00130 SyslogTester 22828 b90b7abc-e54d-4f9e-b1de-0a506fca [customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"] ?Fluentbit forward test
+
+[0] syslog: [[1788325762.577822300, {}], {"pri"=>"14", "message"=>"1 2026-09-02T05.09.22.557550+00:00 SYSKEYDEV-00130 SyslogTester 22828 b90b7abc-e54d-4f9e-b1de-0a506fca [customSturcturedData@32473 Environment="Windows 10" Hardware="Desktop PC"] ∩╗┐Fluentbit forward test", "hostIp"=>"tcp://127.0.0.1:56174"}]
+```
+
+Now we can target to achieve the format required for the elasticsearch, by using the custom parser and the filter. The filter is as follows:
+```
+[FILTER]
+    Name    lua
+    Match   syslog
+    script  enrich_syslog.lua
+    call    enrich
+```
